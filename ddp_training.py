@@ -80,8 +80,9 @@ def cleanup():
 # DATA
 # ============================================================
 
-def create_dataloader(rank, world_size):
 
+# Create dataloaders for train, val, and test splits
+def create_dataloaders(rank, world_size):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(
@@ -90,32 +91,74 @@ def create_dataloader(rank, world_size):
         )
     ])
 
-    dataset = datasets.CIFAR10(
+    # Download only on rank 0
+    train_set = datasets.CIFAR10(
         root="./data",
         train=True,
         download=(rank == 0),
         transform=transform
     )
+    test_set = datasets.CIFAR10(
+        root="./data",
+        train=False,
+        download=False,
+        transform=transform
+    )
 
     dist.barrier()
 
-    sampler = DistributedSampler(
-        dataset,
+    # Split train into train/val
+    val_size = 5000
+    train_size = len(train_set) - val_size
+    train_subset, val_subset = torch.utils.data.random_split(
+        train_set, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    )
+
+    train_sampler = DistributedSampler(
+        train_subset,
         num_replicas=world_size,
         rank=rank,
         shuffle=True
     )
+    val_sampler = DistributedSampler(
+        val_subset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+    test_sampler = DistributedSampler(
+        test_set,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
 
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_subset,
         batch_size=BATCH_SIZE,
-        sampler=sampler,
+        sampler=train_sampler,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=BATCH_SIZE,
+        sampler=val_sampler,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=BATCH_SIZE,
+        sampler=test_sampler,
         num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True
     )
 
-    return dataloader
+    return train_loader, val_loader, test_loader, train_sampler, val_sampler, test_sampler
 
 
 # ============================================================
@@ -150,84 +193,68 @@ def train():
         print(f"World Size: {world_size}")
         print("=" * 60)
 
-    dataloader = create_dataloader(rank, world_size)
 
+    train_loader, val_loader, test_loader, train_sampler, val_sampler, test_sampler = create_dataloaders(rank, world_size)
     model = create_model(device)
-
     criterion = nn.CrossEntropyLoss()
-
     optimizer = optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE
     )
-
-    # Mixed Precision
     scaler = torch.cuda.amp.GradScaler()
-
     total_training_start = time.time()
-
     model.train()
 
+    def evaluate(loader, sampler, desc):
+        model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            sampler.set_epoch(0)
+            for images, labels in loader:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                total_loss += loss.item() * images.size(0)
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += images.size(0)
+        avg_loss = total_loss / total
+        accuracy = correct / total
+        model.train()
+        return avg_loss, accuracy
+
     for epoch in range(EPOCHS):
-
         epoch_start = time.time()
-
-        # Important for proper shuffling across epochs
-        dataloader.sampler.set_epoch(epoch)
-
+        train_sampler.set_epoch(epoch)
         running_loss = 0.0
         total_samples = 0
-
-        for batch_idx, (images, labels) in enumerate(dataloader):
-
+        for batch_idx, (images, labels) in enumerate(train_loader):
             iteration_start = time.time()
-
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-
             optimizer.zero_grad(set_to_none=True)
-
-            # --------------------------------------------
-            # FORWARD PASS (AMP)
-            # --------------------------------------------
             with torch.cuda.amp.autocast():
-
                 outputs = model(images)
-
                 loss = criterion(outputs, labels)
-
-            # --------------------------------------------
-            # BACKWARD PASS
-            # --------------------------------------------
             backward_start = time.time()
-
             scaler.scale(loss).backward()
-
             torch.cuda.synchronize(device)
-
             backward_time = time.time() - backward_start
-
-            # --------------------------------------------
-            # OPTIMIZER STEP
-            # --------------------------------------------
             scaler.step(optimizer)
             scaler.update()
-
             batch_size_actual = images.size(0)
-
             running_loss += loss.item()
             total_samples += batch_size_actual
-
             iteration_time = time.time() - iteration_start
-
             throughput = batch_size_actual / iteration_time
-
             if batch_idx % 50 == 0:
-
                 allocated_memory = (
                     torch.cuda.memory_allocated(device) / 1024**3
                 )
-
                 print(
                     f"[Rank {rank}] "
                     f"Epoch {epoch+1} "
@@ -238,31 +265,27 @@ def train():
                     f"Throughput: {throughput:.2f} samples/s | "
                     f"GPU Memory: {allocated_memory:.2f} GB"
                 )
-
         epoch_time = time.time() - epoch_start
-
-        avg_loss = running_loss / len(dataloader)
-
+        avg_loss = running_loss / len(train_loader)
         samples_per_second = total_samples / epoch_time
-
+        val_loss, val_acc = evaluate(val_loader, val_sampler, desc="Validation")
         if rank == 0:
-
             print("\n" + "=" * 60)
             print(f"EPOCH {epoch+1} COMPLETE")
-            print(f"Average Loss: {avg_loss:.4f}")
+            print(f"Average Train Loss: {avg_loss:.4f}")
+            print(f"Validation Loss: {val_loss:.4f} | Validation Accuracy: {val_acc*100:.2f}%")
             print(f"Epoch Time: {epoch_time:.2f}s")
             print(f"Samples/sec per GPU: {samples_per_second:.2f}")
             print("=" * 60 + "\n")
 
     total_training_time = time.time() - total_training_start
-
+    test_loss, test_acc = evaluate(test_loader, test_sampler, desc="Test")
     if rank == 0:
-
         print("=" * 60)
         print("TRAINING FINISHED")
         print(f"Total Training Time: {total_training_time:.2f}s")
+        print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:.2f}%")
         print("=" * 60)
-
     cleanup()
 
 
