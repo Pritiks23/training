@@ -91,29 +91,50 @@ def create_dataloaders(rank, world_size):
         )
     ])
 
-    # Download only on rank 0
+    # ============================================================
+    # CRITICAL FIX: avoid DDP download race condition
+    # ============================================================
+
+    if rank == 0:
+        datasets.CIFAR10(
+            root="./data",
+            train=True,
+            download=True,
+            transform=transform
+        )
+        datasets.CIFAR10(
+            root="./data",
+            train=False,
+            download=True,
+            transform=transform
+        )
+
+    # force ALL processes to wait until download is complete
+    dist.barrier()
+
+    # Now safe: all ranks just load existing files
     train_set = datasets.CIFAR10(
         root="./data",
         train=True,
-        download=(rank == 0),
+        download=False,
         transform=transform
     )
 
     test_set = datasets.CIFAR10(
         root="./data",
         train=False,
-        download=(rank == 0),
+        download=False,
         transform=transform
     )
-
-# WAIT HERE until rank 0 finishes download
-dist.barrier()
 
     # Split train into train/val
     val_size = 5000
     train_size = len(train_set) - val_size
+
     train_subset, val_subset = torch.utils.data.random_split(
-        train_set, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+        train_set,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
     )
 
     train_sampler = DistributedSampler(
@@ -122,12 +143,14 @@ dist.barrier()
         rank=rank,
         shuffle=True
     )
+
     val_sampler = DistributedSampler(
         val_subset,
         num_replicas=world_size,
         rank=rank,
         shuffle=False
     )
+
     test_sampler = DistributedSampler(
         test_set,
         num_replicas=world_size,
@@ -143,6 +166,7 @@ dist.barrier()
         pin_memory=True,
         persistent_workers=True
     )
+
     val_loader = DataLoader(
         val_subset,
         batch_size=BATCH_SIZE,
@@ -151,6 +175,7 @@ dist.barrier()
         pin_memory=True,
         persistent_workers=True
     )
+
     test_loader = DataLoader(
         test_set,
         batch_size=BATCH_SIZE,
