@@ -307,3 +307,56 @@ if __name__ == "__main__":
     )
 
     train()
+"""
+ddp_training.py
+
+Production-style Distributed Data Parallel (DDP) training example.
+
+Key Features:
+- torchrun launcher support
+- NCCL backend
+- DistributedSampler
+- Automatic gradient synchronization
+- Mixed Precision Training (AMP)
+- Throughput benchmarking
+- Iteration timing
+- Multi-GPU scaling visibility
+
+Launch:
+
+Single Node / 2 GPUs:
+torchrun --nproc_per_node=2 ddp_training.py
+
+Requirements:
+- 2+ NVIDIA GPUs
+- CUDA
+- PyTorch with distributed support
+"""
+
+import os
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets, transforms, models
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    # Only check for GPUs if running distributed
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            assert gpu_count >= 2, (
+                f"Requires at least 2 GPUs. Found {gpu_count}"
+            )
+    train()
