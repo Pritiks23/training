@@ -171,9 +171,12 @@ def create_model(device):
 
     model = model.to(device)
 
+
+    # Use local_rank for device_ids, as recommended by PyTorch DDP docs
+    local_rank = device.index if hasattr(device, 'index') and device.index is not None else int(str(device).split(":")[-1])
     ddp_model = DDP(
         model,
-        device_ids=[device.index]
+        device_ids=[local_rank]
     )
 
     return ddp_model
