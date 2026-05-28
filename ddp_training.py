@@ -98,14 +98,16 @@ def create_dataloaders(rank, world_size):
         download=(rank == 0),
         transform=transform
     )
+
     test_set = datasets.CIFAR10(
         root="./data",
         train=False,
-        download=False,
+        download=(rank == 0),
         transform=transform
     )
 
-    dist.barrier()
+# WAIT HERE until rank 0 finishes download
+dist.barrier()
 
     # Split train into train/val
     val_size = 5000
