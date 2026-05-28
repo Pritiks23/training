@@ -91,28 +91,22 @@ def create_dataloaders(rank, world_size):
         )
     ])
 
-    # ============================================================
-    # CRITICAL FIX: avoid DDP download race condition
-    # ============================================================
-
     if rank == 0:
-        datasets.CIFAR10(
+        _ = datasets.CIFAR10(
             root="./data",
             train=True,
             download=True,
             transform=transform
         )
-        datasets.CIFAR10(
+        _ = datasets.CIFAR10(
             root="./data",
             train=False,
             download=True,
             transform=transform
         )
 
-    # force ALL processes to wait until download is complete
     dist.barrier()
 
-    # Now safe: all ranks just load existing files
     train_set = datasets.CIFAR10(
         root="./data",
         train=True,
